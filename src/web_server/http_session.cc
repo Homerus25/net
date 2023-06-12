@@ -3,7 +3,6 @@
 #include <memory>
 #include <optional>
 #include <utility>
-#include <vector>
 
 #include "boost/beast/http.hpp"
 #include "boost/beast/websocket/rfc6455.hpp"
@@ -15,14 +14,9 @@
 #include "net/web_server/responses.h"
 #include "net/web_server/web_server.h"
 #include "net/web_server/websocket_session.h"
+#include "net/web_server/custom_queue.h"
 
 namespace net {
-
-template <typename T>
-void reset(T& t) {
-  t.~T();
-  new (&t) T;
-}
 
 // Handles an HTTP server connection.
 // This uses the Curiously Recurring Template Pattern so that
@@ -33,102 +27,6 @@ struct http_session {
   // the Curiously Recurring Template Pattern idiom.
   Derived& derived() { return static_cast<Derived&>(*this); }
 
-  // This queue is used for HTTP pipelining.
-  struct queue {
-    // The type-erased, saved work item
-    struct response {
-      response() = default;
-      virtual ~response() = default;
-      response(response const&) = delete;
-      response& operator=(response const&) = delete;
-      response(response&&) = delete;
-      response& operator=(response&&) = delete;
-
-      virtual void send() = 0;
-    };
-
-    explicit queue(http_session& self, std::size_t limit)
-        : self_(self), limit_(limit) {
-      items_.reserve(limit);
-    }
-
-    ~queue() = default;
-    queue(queue const&) = delete;
-    queue& operator=(queue const&) = delete;
-    queue(queue&&) = delete;
-    queue& operator=(queue&&) = delete;
-
-    // Returns `true` if we have reached the queue limit
-    bool is_full() const { return items_.size() >= limit_; }
-
-    // Called when a message finishes sending
-    // Returns `true` if the caller should initiate a read
-    bool on_write() {
-      BOOST_ASSERT(!items_.empty());
-      auto const was_full = is_full();
-      items_.erase(items_.begin());
-      return was_full;
-    }
-
-    bool send_next() {
-      if (items_.empty() || !items_.front()->is_finished()) {
-        return false;
-      }
-      self_.write_active_ = true;
-      items_.front()->response_->send();
-      return true;
-    }
-
-    struct pending_request {
-      explicit pending_request(http_session& session) : self_(session) {}
-
-      bool is_finished() const { return static_cast<bool>(response_); }
-
-      // Called by the HTTP handler to send a response.
-      template <bool IsRequest, class Body, class Fields>
-      void operator()(
-          boost::beast::http::message<IsRequest, Body, Fields>&& msg) {
-        // This holds a work item
-        struct response_impl : response {
-          http_session& self_;
-          boost::beast::http::message<IsRequest, Body, Fields> msg_;
-
-          response_impl(
-              http_session& self,
-              boost::beast::http::message<IsRequest, Body, Fields>&& msg)
-              : self_(self), msg_(std::move(msg)) {}
-
-          void send() override {
-            boost::beast::http::async_write(
-                self_.derived().stream(), msg_,
-                boost::beast::bind_front_handler(
-                    &http_session::on_write, self_.derived().shared_from_this(),
-                    msg_.need_eof()));
-          }
-        };
-
-        response_ = std::make_unique<response_impl>(self_, std::move(msg));
-        boost::asio::post(self_.derived().stream().get_executor(),
-                          [&, self = self_.derived().shared_from_this()]() {
-                            self_.send_next_response();
-                          });
-      }
-
-      http_session& self_;
-      std::unique_ptr<response> response_;
-    };
-
-    pending_request& add_entry() {
-      return *items_.emplace_back(std::make_unique<pending_request>(self_))
-                  .get();
-    }
-
-    http_session& self_;
-    std::vector<std::unique_ptr<pending_request>> items_;
-    // Maximum number of responses we will queue
-    std::size_t limit_;
-  };
-
   // Construct the session
   http_session(boost::beast::flat_buffer buffer,
                web_server_settings_ptr settings)
@@ -137,22 +35,31 @@ struct http_session {
         settings_(std::move(settings)) {}
 
   void do_read() {
-    // Construct a new parser for each message
-    reset(parser_);
-
-    // Apply a reasonable limit to the allowed size
-    // of the body in bytes to prevent abuse.
-    parser_.body_limit(settings_->request_body_limit_);
-
-    // Set the timeout.
-    boost::beast::get_lowest_layer(derived().stream())
-        .expires_after(settings_->timeout_);
+    reset_parser();
+    set_connection_timeout();
 
     // Read a request using the parser-oriented interface
     boost::beast::http::async_read(
-        derived().stream(), buffer_, parser_,
+        derived().stream(), buffer_, *parser_,
         boost::beast::bind_front_handler(&http_session::on_read,
                                          derived().shared_from_this()));
+  }
+  void set_connection_timeout() {
+    boost::beast::get_lowest_layer(derived().stream())
+        .expires_after(settings_->timeout_);
+  }
+
+  void reset_parser() {
+    parser_.reset(new boost::beast::http::request_parser<boost::beast::http::string_body>());
+
+    // Apply a reasonable limit to the allowed size
+    // of the body in bytes to prevent abuse.
+    parser_->body_limit(settings_->request_body_limit_);
+  }
+
+  bool call_ws_upgrade_ok_callback() {
+    return !settings_->ws_upgrade_ok_ ||
+        settings_->ws_upgrade_ok_(parser_->get());
   }
 
   void on_read(boost::beast::error_code ec, std::size_t bytes_transferred) {
@@ -168,41 +75,52 @@ struct http_session {
     }
 
     // See if it is a WebSocket Upgrade
-    if (boost::beast::websocket::is_upgrade(parser_.get())) {
-      if (!settings_->ws_upgrade_ok_ ||
-          settings_->ws_upgrade_ok_(parser_.get())) {
-        // Disable the timeout.
-        // The websocket::stream uses its own timeout settings.
-        boost::beast::get_lowest_layer(derived().stream()).expires_never();
-
-        // Create a websocket session, transferring ownership
-        // of both the socket and the HTTP request.
-        return make_websocket_session(derived().release_stream(),
-                                      parser_.release(), settings_);
+    if (boost::beast::websocket::is_upgrade(parser_->get())) {
+      if (call_ws_upgrade_ok_callback()) {
+        upgrade_session_to_ws();
+        return;
       } else {
         queue_.add_entry()(
-            not_found_response(parser_.release(), "No upgrade possible"));
+            not_found_response(parser_->release(), "No upgrade possible"));
       }
     } else {
-      auto& queue_entry = queue_.add_entry();
-      if (settings_->http_req_cb_) {
-        settings_->http_req_cb_(
-            parser_.release(),
-            [self = derived().shared_from_this(),
-             &queue_entry](web_server::http_res_t&& res) {
-              std::visit(queue_entry, std::move(res));
-            },
-            derived().is_ssl());
-      } else {
-        queue_entry(
-            not_found_response(parser_.release(), "No handler implemented"));
-      }
+      handle_incoming_message();
     }
 
     // If we aren't at the queue limit, try to pipeline another request
     if (!queue_.is_full()) {
       do_read();
     }
+  }
+
+  void handle_incoming_message() {
+    auto& queue_entry = queue_.add_entry();
+    //queue<http_session>::pending_request2& queue_entry = queue_.add_entry();
+
+    if (settings_->http_req_cb_) {
+      settings_->http_req_cb_(
+          parser_->release(),
+          [self = derived().shared_from_this(),
+           &queue_entry](web_server::http_res_t&& res) {
+            std::visit(queue_entry, std::move(res));
+          },
+          derived().is_ssl());
+    }
+    else {
+    //if (!call_http_req_callback(queue_entry)) {
+      queue_entry(
+          not_found_response(parser_->release(), "No handler implemented"));
+    }
+  }
+
+  void upgrade_session_to_ws() {  // Disable the timeout.
+    // The websocket::stream uses its own timeout settings.
+    boost::beast::get_lowest_layer(derived().stream()).expires_never();
+
+    // Create a websocket session, transferring ownership
+    // of both the socket and the HTTP request.
+    make_websocket_session(derived().release_stream(), parser_->release(),
+                                  settings_);
   }
 
   void on_write(bool close, boost::beast::error_code ec,
@@ -234,12 +152,12 @@ struct http_session {
     queue_.send_next();
   }
 
-  queue queue_;
+  queue<http_session> queue_;
   bool write_active_{false};
 
   boost::beast::flat_buffer buffer_;
 
-  boost::beast::http::request_parser<boost::beast::http::string_body> parser_;
+  std::unique_ptr<boost::beast::http::request_parser<boost::beast::http::string_body>> parser_;
 
   web_server_settings_ptr settings_;
 };
