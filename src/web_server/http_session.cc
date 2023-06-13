@@ -14,7 +14,6 @@
 #include "net/web_server/responses.h"
 #include "net/web_server/web_server.h"
 #include "net/web_server/websocket_session.h"
-#include "net/web_server/custom_queue.h"
 
 namespace net {
 
@@ -30,8 +29,7 @@ struct http_session {
   // Construct the session
   http_session(boost::beast::flat_buffer buffer,
                web_server_settings_ptr settings)
-      : queue_(*this, settings->request_queue_limit_),
-        buffer_(std::move(buffer)),
+      : buffer_(std::move(buffer)),
         settings_(std::move(settings)) {}
 
   void do_read() {
@@ -80,36 +78,39 @@ struct http_session {
         upgrade_session_to_ws();
         return;
       } else {
-        queue_.add_entry()(
-            not_found_response(parser_->release(), "No upgrade possible"));
+        web_server::http_res_t error_response{not_found_response(parser_->release(), "No upgrade possible")};
+        send_respond(error_response);
       }
     } else {
       handle_incoming_message();
     }
+  }
+  void send_respond(web_server::http_res_t& msg) {
+    outgoingMsg = std::make_shared<web_server::http_res_t>(std::move(msg));
 
-    // If we aren't at the queue limit, try to pipeline another request
-    if (!queue_.is_full()) {
-      do_read();
-    }
+    auto sse = [this](auto& lambda_msg){
+      boost::beast::http::async_write(
+          this->derived().stream(), lambda_msg,
+          boost::beast::bind_front_handler(
+              &http_session<Derived>::on_write, this->derived().shared_from_this(),
+              lambda_msg.need_eof()));
+    };
+
+    std::visit(sse, *outgoingMsg);
   }
 
   void handle_incoming_message() {
-    auto& queue_entry = queue_.add_entry();
-    //queue<http_session>::pending_request2& queue_entry = queue_.add_entry();
-
     if (settings_->http_req_cb_) {
       settings_->http_req_cb_(
           parser_->release(),
-          [self = derived().shared_from_this(),
-           &queue_entry](web_server::http_res_t&& res) {
-            std::visit(queue_entry, std::move(res));
+          [this](web_server::http_res_t&& res) {
+            send_respond(res);
           },
           derived().is_ssl());
     }
     else {
-    //if (!call_http_req_callback(queue_entry)) {
-      queue_entry(
-          not_found_response(parser_->release(), "No handler implemented"));
+      web_server::http_res_t error_response{not_found_response(parser_->release(), "No handler implemented")};
+      send_respond(error_response);
     }
   }
 
@@ -127,7 +128,6 @@ struct http_session {
                 std::size_t bytes_transferred) {
     boost::ignore_unused(bytes_transferred);
 
-    write_active_ = false;
     if (ec) {
       return fail(ec, "write");
     }
@@ -138,28 +138,13 @@ struct http_session {
       return derived().do_eof();
     }
 
-    // Inform the queue that a write completed
-    if (queue_.on_write()) {
-      // Read another request
-      do_read();
-    }
+    do_read();
   }
-
-  void send_next_response() {
-    if (write_active_) {
-      return;
-    }
-    queue_.send_next();
-  }
-
-  queue<http_session> queue_;
-  bool write_active_{false};
 
   boost::beast::flat_buffer buffer_;
-
   std::unique_ptr<boost::beast::http::request_parser<boost::beast::http::string_body>> parser_;
-
   web_server_settings_ptr settings_;
+  std::shared_ptr<web_server::http_res_t> outgoingMsg;
 };
 
 //------------------------------------------------------------------------------
