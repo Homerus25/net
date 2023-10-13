@@ -4,28 +4,28 @@
 #include <string>
 #include <vector>
 
-#include "net/web_server/web_server.h"
+#include "net/web_server/aliases.h"
 
 namespace net {
 
 struct query_router {
-  using request = web_server::http_req_t;
-  using reply = web_server::http_res_t;
+  using request = http_req_t;
+  using reply = http_res_t;
 
-  struct route_request : public web_server::http_req_t {
-    route_request(request req) : web_server::http_req_t(req) {}
+  struct route_request : public http_req_t {
+    route_request(request req) : http_req_t(req) {}
     std::vector<std::string> path_params_;
     std::string username_, password_;
   };
 
   using route_request_handler = std::function<void(
-      route_request const&, web_server::http_res_cb_t, bool)>;
+      route_request const&, http_res_cb_t, bool)>;
 
   query_router& route(std::string method, std::string const& path_regex,
                       route_request_handler handler);
-  void operator()(web_server::http_req_t, web_server::http_res_cb_t const&,
+  void operator()(http_req_t, http_res_cb_t const&,
                   bool);
-  void reply_hook(std::function<void(web_server::http_res_t&)> reply_hook);
+  void reply_hook(std::function<void(http_res_t&)> reply_hook);
   void enable_cors();
 
 private:

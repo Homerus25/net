@@ -1,8 +1,6 @@
 #include "net/web_server/content_encoding.h"
 
-#include <cstdlib>
 #include <algorithm>
-#include <locale>
 #include <sstream>
 
 #include "boost/beast/http/rfc7230.hpp"
@@ -58,7 +56,7 @@ std::string gzip_content(
   return compressed;
 }
 
-void set_response_body(web_server::string_res_t& res,
+void set_response_body(string_res_t& res,
                        http_content_encoding const encoding,
                        std::string_view const content) {
   switch (encoding) {
@@ -72,8 +70,8 @@ void set_response_body(web_server::string_res_t& res,
   }
 }
 
-void set_response_body(web_server::string_res_t& res,
-                       web_server::http_req_t const& req,
+void set_response_body(string_res_t& res,
+                       http_req_t const& req,
                        std::string_view const content) {
   set_response_body(
       res, select_content_encoding(req[http::field::accept_encoding]), content);

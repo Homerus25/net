@@ -12,7 +12,7 @@
 
 #include "net/web_server/fail.h"
 #include "net/web_server/responses.h"
-#include "net/web_server/web_server.h"
+#include "net/web_server/aliases.h"
 #include "net/web_server/websocket_session.h"
 
 namespace net {
@@ -78,15 +78,15 @@ struct http_session {
         upgrade_session_to_ws();
         return;
       } else {
-        web_server::http_res_t error_response{not_found_response(parser_->release(), "No upgrade possible")};
+        http_res_t error_response{not_found_response(parser_->release(), "No upgrade possible")};
         send_respond(error_response);
       }
     } else {
       handle_incoming_message();
     }
   }
-  void send_respond(web_server::http_res_t& msg) {
-    outgoingMsg = std::make_shared<web_server::http_res_t>(std::move(msg));
+  void send_respond(http_res_t& msg) {
+    outgoingMsg = std::make_shared<http_res_t>(std::move(msg));
 
     auto sse = [this](auto& lambda_msg){
       boost::beast::http::async_write(
@@ -103,13 +103,13 @@ struct http_session {
     if (settings_->http_req_cb_) {
       settings_->http_req_cb_(
           parser_->release(),
-          [this](web_server::http_res_t&& res) {
+          [this](http_res_t&& res) {
             send_respond(res);
           },
           derived().is_ssl());
     }
     else {
-      web_server::http_res_t error_response{not_found_response(parser_->release(), "No handler implemented")};
+      http_res_t error_response{not_found_response(parser_->release(), "No handler implemented")};
       send_respond(error_response);
     }
   }
@@ -144,7 +144,7 @@ struct http_session {
   boost::beast::flat_buffer buffer_;
   std::unique_ptr<boost::beast::http::request_parser<boost::beast::http::string_body>> parser_;
   web_server_settings_ptr settings_;
-  std::shared_ptr<web_server::http_res_t> outgoingMsg;
+  std::shared_ptr<http_res_t> outgoingMsg;
 };
 
 //------------------------------------------------------------------------------

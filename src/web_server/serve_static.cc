@@ -114,8 +114,8 @@ std::string add_trailing_slash(std::string_view target) {
 }
 
 bool handle_directory_redirect(std::string const& path,
-                               web_server::http_req_t const& req,
-                               web_server::http_res_cb_t const& cb) {
+                               http_req_t const& req,
+                               http_res_cb_t const& cb) {
   boost::system::error_code sys_ec;
   auto const file_status = fs::status(fs::path{path}, sys_ec);
   if (!sys_ec.failed() && fs::is_directory(file_status)) {
@@ -126,8 +126,8 @@ bool handle_directory_redirect(std::string const& path,
 }
 
 bool serve_static_file(beast::string_view doc_root,
-                       web_server::http_req_t const& req,
-                       web_server::http_res_cb_t const& cb) {
+                       http_req_t const& req,
+                       http_res_cb_t const& cb) {
   if (req.method() != http::verb::get && req.method() != http::verb::head) {
     cb(bad_request_response(req, "Invalid method"));
     return true;
@@ -182,7 +182,7 @@ bool serve_static_file(beast::string_view doc_root,
     cb(res);
     return true;
   } else {
-    auto res = web_server::file_res_t{
+    auto res = file_res_t{
         std::piecewise_construct, std::make_tuple(std::move(body)),
         std::make_tuple(http::status::ok, req.version())};
     res.set(http::field::content_type, content_type);

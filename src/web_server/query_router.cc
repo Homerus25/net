@@ -26,12 +26,12 @@ void query_router::reply_hook(std::function<void(reply&)> reply_hook) {
 void query_router::enable_cors() {
   reply_hook([](reply& rep) { net::enable_cors(rep); });
   route("OPTIONS", ".*",
-        [](route_request const& req, const web_server::http_res_cb_t& cb,
+        [](route_request const& req, const http_res_cb_t& cb,
            bool) { return cb(empty_response(req)); });
 }
 
-void query_router::operator()(web_server::http_req_t req,
-                              web_server::http_res_cb_t const& cb,
+void query_router::operator()(http_req_t req,
+                              http_res_cb_t const& cb,
                               bool is_ssl) {
   std::cmatch match;
   auto route = std::find_if(
